@@ -2,26 +2,22 @@ var path = require('path');
 
 require('require-self-ref');
 require('../../../node-require').install();
-require('../../../express');
-
-require('../../../compiler').configure({
-    assumeUpToDate: false
-});
 
 var JSDOM = require('jsdom-global');
-var express = require('express');
+var MemoryFs = require('memory-fs');
 var lasso = require('lasso');
 var defaultPageTemplate = require('./page-template.marko');
 var fs = require('fs');
 var mkdirp = require('mkdirp');
 var md5Hex = require('md5-hex');
 var ok = require('assert').ok;
+var url = require('url');
 var shouldCover = !!process.env.NYC_CONFIG;
 
 function generate(options) {
     return new Promise((resolve, reject) => {
+        var memFs = new MemoryFs();
         var testsFile = options.testsFile;
-        var startServer = options.server === true;
         var pageTemplate = options.pageTemplate || defaultPageTemplate;
         var generatedDir = options.generatedDir;
         ok(generatedDir, '"options.generatedDir" is required');
@@ -35,11 +31,16 @@ function generate(options) {
 
         var lassoConfig = {
             outputDir: path.join(generatedDir, 'static'),
-            urlPrefix: startServer ? '/static' : './static',
+            urlPrefix: './static',
+            minify: false,
             bundlingEnabled: false,
             fingerprintsEnabled: false,
-            minify: false,
             plugins: [{
+                plugin: 'lasso-fs-writer',
+                config: {
+                    fileSystem: memFs
+                }
+            }, {
                 plugin: 'lasso-marko',
                 config: {
                     output: 'vdom'
@@ -69,92 +70,61 @@ function generate(options) {
             enumerable: false
         });
 
-        if (startServer) {
-            var app = express();
+        pageTemplate.render(templateData, function (err, html) {
+            if (err) {
+                return reject(err);
+            }
 
-            app.use(require('lasso/middleware').serveStatic({ lasso: myLasso }));
-            app.get('/', function (req, res) {
-                res.marko(pageTemplate, templateData);
+            resolve({
+                html: String(html),
+                outputFile: outputFile,
+                fs: memFs
             });
-
-            var port = 8080;
-
-            var server = app.listen(port, function (err) {
-                if (err) {
-                    throw err;
-                }
-
-                var host = 'localhost';
-                var port = server.address().port;
-                var url = `http://${host}:${port}`;
-
-                console.log(`Server running at ${url}`);
-
-                if (process.send) {
-                    process.send('online');
-                }
-
-                resolve({ url: url });
-            });
-        } else {
-            try {
-                mkdirp.sync(generatedDir);
-            } catch (e) {}
-
-            pageTemplate.render(templateData, function (err, html) {
-                if (err) {
-                    return reject(err);
-                }
-
-                fs.writeFileSync(outputFile, html, { encoding: 'utf8' });
-
-                resolve({
-                    url: outputFile
-                });
-            });
-        }
+        });
     });
 }
 
 function runTests(options) {
     return generate(options).then(generated => {
         return new Promise(function (resolve, reject) {
-            fs.readFile(generated.url, 'utf-8', function (err, html) {
-                if (err) {
-                    return reject(err)
+            var html = generated.html;
+            var memFs = generated.fs;
+            var outputFile = generated.outputFile;
+            var cleanup = JSDOM(html, {
+                url: 'file://' + outputFile,
+                resourceLoader: function (resource, done) {
+                    memFs.readFile(url.resolve(outputFile, resource.url.pathname), done);
+                },
+                features: {
+                    FetchExternalResources: ["script", "iframe", "link"]
                 }
+            });
 
-                var cleanup = JSDOM(html, {
-                    url: 'file://' + generated.url,
-                    features: {
-                        FetchExternalResources: ["script", "iframe", "link"]
+            window.addEventListener('error', function (ev) {
+                reject(ev.error);
+            });
+
+            window.addEventListener('load', function () {
+                var runner = window.MOCHA_RUNNER;
+                runner.on('end', function () {
+                    if (shouldCover) {
+                        var coverageFile = getCoverageFile(options.testsFile);
+                        fs.writeFileSync(coverageFile, JSON.stringify(window.__coverage__));
                     }
-                });
-                window.addEventListener('error', function (ev) {
-                    reject(ev.error);
-                });
-                window.addEventListener('load', function () {
-                    var runner = window.MOCHA_RUNNER;
-                    runner.on('end', function () {
-                        if (shouldCover) {
-                            var coverageFile = getCoverageFile(options.testsFile);
-                            fs.writeFileSync(coverageFile, JSON.stringify(window.__coverage__));
-                        }
-    
-                        cleanup();
 
-                        runner.stats.failures.length
-                            ? reject(new Error(runner.stats.failures.join(', ')))
-                            : resolve();
-                    });
+                    cleanup();
+
+                    runner.stats.failures.length
+                        ? reject(new Error(runner.stats.failures.join(', ')))
+                        : resolve();
                 });
-            })
-        })
+            });
+        });
     });
 }
 
 function getCoverageFile(testsFile) {
-    return './.nyc_output/'+md5Hex(testsFile)+'.json';
+    return './.nyc_output/' + md5Hex(testsFile) + '.json';
 }
 
 exports.generate = generate;
